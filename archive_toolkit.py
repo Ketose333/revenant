@@ -235,9 +235,8 @@ def survey_site(site_id, domains, data_root=None):
     # (과거 실행이 일부 파일을 루트에 평평하게 저장해 파일명 대체가 필요하다)
     unclaimed = {}
     if paths["files"].exists():
-        for f in paths["files"].rglob("*"):
-            if f.is_file():
-                unclaimed[f.relative_to(paths["files"]).as_posix()] = f.name
+        for relative, safe in iter_safe_files(paths["files"]):
+            unclaimed[relative.as_posix()] = safe.name
 
     def local_rel(p):
         rel = p.lstrip("/")
@@ -356,6 +355,19 @@ def safe_destination(root, relative):
         raise ValueError(f"파일 저장 경로가 아니다: {target}")
     return target
 
+
+def iter_safe_files(root, pattern="*"):
+    """root 아래 열거 결과를 상대경로로 바꾼 뒤 링크 안전성을 재검증한다."""
+    root = Path(root)
+    for candidate in root.rglob(pattern):
+        try:
+            relative = candidate.relative_to(root)
+            safe = safe_destination(root, relative)
+        except ValueError:
+            continue
+        if safe.is_file():
+            yield relative, safe
+
 def fetch_common_crawl_index(domain, index, headers=DEFAULT_HEADERS, tries=5):
     """Common Crawl 구형 CDXJ 색인에서 성공 응답만 읽는다."""
     query = urllib.parse.urlencode({
@@ -455,7 +467,7 @@ def write_new_bytes(dest, data, root=None):
     except FileExistsError:
         return dest.read_bytes() == data
 
-def refetch_verified(path, snapshots, dest, tries=4):
+def refetch_verified(path, snapshots, dest, tries=4, root=None):
     """아카이브에서 다시 받되, 지문이 기록과 맞을 때만 파일을 교체한다.
 
     맞지 않으면 아무것도 쓰지 않는다. 원본 폴더에 검증 안 된 바이트를 남기지 않기 위함이다.
@@ -476,6 +488,13 @@ def refetch_verified(path, snapshots, dest, tries=4):
             if got != snap["digest"]:
                 print(f"    [건너뜀] {snap['timestamp']} 지문 불일치 (기록 {snap['digest']} / 수신 {got})")
                 break
+            if root is not None:
+                try:
+                    relative = Path(dest).relative_to(Path(root))
+                    dest = safe_destination(root, relative)
+                except ValueError as error:
+                    print(f"    [건너뜀] 안전하지 않은 저장 경로: {error}")
+                    return None
             dest.parent.mkdir(parents=True, exist_ok=True)
             with open(dest, "wb") as f:
                 f.write(data)
@@ -519,10 +538,8 @@ def verify_site(site_id, domains, repair=False, data_root=None):
     for p in snaps:
         snaps[p].sort(key=lambda x: x.get("timestamp", ""), reverse=True)
 
-    local = sorted(
-        f for f in paths["files"].rglob("*") if f.is_file()
-    )
-    by_rel = {f.relative_to(paths["files"]).as_posix(): f for f in local}
+    local = sorted(iter_safe_files(paths["files"]), key=lambda item: item[0].as_posix())
+    by_rel = {relative.as_posix(): safe for relative, safe in local}
     by_name = collections.defaultdict(list)
     for rel, f in by_rel.items():
         by_name[Path(rel).name].append(rel)
@@ -568,7 +585,15 @@ def verify_site(site_id, domains, repair=False, data_root=None):
         print(f"\n[*] 불일치 {len(mismatch)}건 재수신 (지문이 맞을 때만 교체)")
         for rel, p in mismatch:
             print(f"  {rel}")
-            got = refetch_verified(p, snaps.get(p, []), paths["files"] / rel)
+            try:
+                destination = safe_destination(paths["files"], rel)
+            except ValueError as error:
+                print(f"    [건너뜀] 안전하지 않은 저장 경로: {error}")
+                failed.append(rel)
+                continue
+            got = refetch_verified(
+                p, snaps.get(p, []), destination, root=paths["files"]
+            )
             if got:
                 ts, size, dg = got
                 print(f"    [교체] {ts} {size} bytes 지문={dg}")
@@ -767,7 +792,14 @@ def verify_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, data_roo
         candidates = [natural] if natural.is_file() else []
         variants = paths["captures"] / "common_crawl"
         if variants.exists():
-            candidates.extend(p for p in variants.glob(f"*/{rel}") if p.is_file())
+            for candidate in variants.glob(f"*/{rel}"):
+                try:
+                    relative = candidate.relative_to(paths["captures"])
+                    safe = safe_destination(paths["captures"], relative)
+                except ValueError:
+                    continue
+                if safe.is_file():
+                    candidates.append(safe)
         if not candidates:
             absent.append(rel)
         elif any(payload_digest(candidate) in digests for candidate in candidates):
@@ -827,7 +859,7 @@ def restore_domain(domains, output_dir, max_workers=3, delay=0.15):
             return rel, True, "기존 파일 존재", dest_file.stat().st_size
 
         time.sleep(delay)
-        got = refetch_verified(rel, snaps, dest_file, tries=3)
+        got = refetch_verified(rel, snaps, dest_file, tries=3, root=out_path)
         if got:
             ts, size, _ = got
             return rel, True, f"성공 ({ts})", size
@@ -892,8 +924,15 @@ def generate_viewer(target_dir, out_path, max_dim=None):
     if not p_dir.exists():
         print(f"[!] 디렉터리가 존재하지 않습니다: {target_dir}")
         return
+    if is_link_or_reparse(p_dir):
+        print(f"[!] 링크 또는 reparse point는 뷰어 원본으로 사용하지 않습니다: {target_dir}")
+        return
+    p_dir = p_dir.resolve()
 
-    all_files = [f for f in p_dir.glob("**/*.*") if f.name != "archive_viewer.html"]
+    all_files = [
+        safe for relative, safe in iter_safe_files(p_dir, "*.*")
+        if relative.name != "archive_viewer.html"
+    ]
     images = [f for f in all_files if f.suffix.lower() in IMG_MIME]
     flash = [f for f in all_files if f.suffix.lower() == ".swf"]
     pages = [f for f in all_files if f.suffix.lower() in [".htm", ".html"]]

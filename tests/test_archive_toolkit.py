@@ -1,6 +1,7 @@
 import base64
 import gzip
 import hashlib
+import io
 import os
 import subprocess
 import sys
@@ -14,6 +15,29 @@ import archive_toolkit as toolkit
 
 def digest(data):
     return base64.b32encode(hashlib.sha1(data).digest()).decode("ascii")
+
+
+def make_directory_link(link, target, link_kind):
+    if link_kind == "symlink":
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlink unavailable: {error}")
+        return
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        pytest.skip(f"junction unavailable: {result.stderr}")
+
+
+def remove_directory_link(link):
+    if link.is_symlink():
+        link.unlink()
+    else:
+        link.rmdir()
 
 
 def test_arc_payload_extracted():
@@ -252,3 +276,67 @@ def test_viewer_paths_escaped(tmp_path):
     assert "page#fragment&amp;name.html" in rendered
     assert "flash&amp;name.swf" in rendered
     assert "flash&name.swf" not in rendered
+
+
+@pytest.mark.parametrize("link_kind", ["symlink"] + (["junction"] if os.name == "nt" else []))
+def test_verify_repair_link_blocked(link_kind, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    files = root / "sites" / "sample" / "files"
+    external = tmp_path / "external"
+    files.mkdir(parents=True)
+    external.mkdir()
+    outside = external / "asset.jpg"
+    outside.write_bytes(b"outside")
+    link = files / "linked"
+    make_directory_link(link, external, link_kind)
+    replacement = b"replacement"
+    record = {
+        "statuscode": "200",
+        "original": "https://example.test/linked/asset.jpg",
+        "timestamp": "20200101000000",
+        "digest": digest(replacement),
+    }
+    monkeypatch.setattr(toolkit, "fetch_cdx_domain", lambda domain: ([record], True))
+    monkeypatch.setattr(
+        toolkit.urllib.request, "urlopen",
+        lambda request, timeout: io.BytesIO(replacement),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "archive_toolkit.py", "--data-root", str(root), "verify",
+            "--site", "sample", "--domains", "example.test", "--repair",
+        ],
+    )
+    try:
+        toolkit.main()
+        assert outside.read_bytes() == b"outside"
+    finally:
+        remove_directory_link(link)
+
+
+@pytest.mark.parametrize("link_kind", ["symlink"] + (["junction"] if os.name == "nt" else []))
+def test_viewer_link_blocked(link_kind, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    site = root / "sites" / "sample"
+    files = site / "files"
+    external = tmp_path / "external"
+    files.mkdir(parents=True)
+    external.mkdir()
+    outside = external / "asset.png"
+    outside.write_bytes(b"private-image")
+    link = files / "linked"
+    make_directory_link(link, external, link_kind)
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "archive_toolkit.py", "--data-root", str(root), "view",
+            "--site", "sample",
+        ],
+    )
+    try:
+        toolkit.main()
+        rendered = (site / "viewer.html").read_text(encoding="utf-8")
+        assert base64.b64encode(b"private-image").decode("ascii") not in rendered
+    finally:
+        remove_directory_link(link)
