@@ -59,7 +59,6 @@ def fetch_cdx(query_pattern, headers=DEFAULT_HEADERS, tries=5):
     return []
 
 ROOT = Path(__file__).resolve().parent
-SITES_DIR = ROOT / "sites"
 POLICY_PATH = ROOT / "policy.json"
 
 COMMON_CRAWL_INDEXES = (
@@ -81,8 +80,14 @@ def load_policy():
     with open(POLICY_PATH, encoding="utf-8") as f:
         return json.load(f)
 
-def site_paths(site_id):
-    base = SITES_DIR / site_id
+def resolve_data_root(cli_value=None):
+    """CLI, 환경변수, 저장소 기본값 순으로 데이터 루트를 결정한다."""
+    value = cli_value if cli_value is not None else os.environ.get("ARCHIVES_DATA_ROOT")
+    return Path(value or ROOT / "data").expanduser().resolve()
+
+
+def site_paths(site_id, data_root=None):
+    base = resolve_data_root(data_root) / "sites" / site_id
     return {
         "base": base,
         "files": base / "files",
@@ -171,9 +176,9 @@ def preserve_common_crawl_inventory(inventory, previous, files_root):
     totals["saved"] = sum(1 for asset in inventory["assets"] if asset["local"] == "saved")
     return inventory
 
-def survey_site(site_id, domains):
+def survey_site(site_id, domains, data_root=None):
     """CDX 색인만 읽어 경로를 전수 조사한다. 바이트는 내려받지 않는다."""
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     paths["base"].mkdir(parents=True, exist_ok=True)
     previous = {}
     if paths["inventory"].exists():
@@ -443,13 +448,13 @@ def refetch_verified(path, snapshots, dest, tries=4):
             return snap["timestamp"], len(data), got
     return None
 
-def verify_site(site_id, domains, repair=False):
+def verify_site(site_id, domains, repair=False, data_root=None):
     """files/의 바이트가 아카이브 기록과 같은지 대조한다.
 
     repair=False면 파일을 건드리지 않는다. repair=True면 지문이 틀린 파일만
     다시 받아 교체하되, 받은 바이트의 지문이 기록과 맞을 때만 쓴다.
     """
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     if not paths["files"].exists():
         print(f"[!] 원본 폴더가 없다: {paths['files']}")
         return None
@@ -544,9 +549,9 @@ def verify_site(site_id, domains, repair=False):
         "repaired": repaired, "failed": failed,
     }
 
-def update_common_crawl_inventory(site_id, domains, indexes, records, captures):
+def update_common_crawl_inventory(site_id, domains, indexes, records, captures, data_root=None):
     """Common Crawl 조사·다운로드 결과를 inventory.json에 재현 가능하게 기록한다."""
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     inventory = {}
     if paths["inventory"].exists():
         with open(paths["inventory"], encoding="utf-8") as f:
@@ -627,9 +632,10 @@ def update_common_crawl_inventory(site_id, domains, indexes, records, captures):
     print(f"[+] Common Crawl 기록: {paths['inventory']}")
     return inventory
 
-def restore_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, max_workers=3, delay=0.15):
+def restore_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, max_workers=3,
+                         delay=0.15, data_root=None):
     """Common Crawl ARC에서 검증된 HTTP payload 원본을 복원한다."""
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     paths["files"].mkdir(parents=True, exist_ok=True)
     paths["captures"].mkdir(parents=True, exist_ok=True)
     records = fetch_common_crawl_records(domains, indexes)
@@ -701,16 +707,18 @@ def restore_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, max_wor
             "digest": record["digest"],
             "bytes": size,
         })
-    update_common_crawl_inventory(site_id, domains, indexes, records, captures)
+    update_common_crawl_inventory(
+        site_id, domains, indexes, records, captures, data_root=data_root
+    )
     saved = sum(1 for _, status, _, _, _ in results if status in ("saved", "variant_saved"))
     existing = sum(1 for _, status, _, _, _ in results if "existing" in status)
     failed = sum(1 for _, status, _, _, _ in results if status == "failed")
     print(f"[+] Common Crawl 완료: 신규 {saved} / 기존확인 {existing} / 실패 {failed}")
     return {"saved": saved, "existing": existing, "failed": failed, "captures": captures}
 
-def verify_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES):
+def verify_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, data_root=None):
     """Common Crawl 캡처 지문과 로컬 원본을 읽기 전용으로 대조한다."""
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     records = fetch_common_crawl_records(domains, indexes)
     if records is None:
         print("[!] 색인이 반쪽이므로 대조를 중단한다")
@@ -1022,6 +1030,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Wayback Machine 아카이브 전수조사·복원 툴킷 (sites/<id>/ 단위로 동작)"
     )
+    parser.add_argument(
+        "--data-root", type=Path,
+        help="조사 데이터 루트 (기본: ARCHIVES_DATA_ROOT 또는 저장소의 data 폴더)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     survey_parser = subparsers.add_parser(
@@ -1057,14 +1069,15 @@ def main():
                                help="Common Crawl 인덱스 목록")
 
     args = parser.parse_args()
-    paths = site_paths(args.site)
+    data_root = resolve_data_root(args.data_root)
+    paths = site_paths(args.site, data_root=data_root)
 
     if args.command == "survey":
-        survey_site(args.site, args.domains)
+        survey_site(args.site, args.domains, data_root=data_root)
     elif args.command == "download":
         if args.archive == "common_crawl":
             restore_common_crawl(args.site, args.domains, indexes=args.cc_indexes,
-                                 max_workers=args.threads)
+                                 max_workers=args.threads, data_root=data_root)
         else:
             restore_domain(args.domains, paths["files"], max_workers=args.threads)
         generate_viewer(paths["files"], out_path=paths["viewer"])
@@ -1074,9 +1087,11 @@ def main():
         if args.archive == "common_crawl":
             if args.repair:
                 parser.error("Common Crawl verify는 --repair를 지원하지 않는다. download를 다시 실행할 것")
-            verify_common_crawl(args.site, args.domains, indexes=args.cc_indexes)
+            verify_common_crawl(
+                args.site, args.domains, indexes=args.cc_indexes, data_root=data_root
+            )
         else:
-            verify_site(args.site, args.domains, repair=args.repair)
+            verify_site(args.site, args.domains, repair=args.repair, data_root=data_root)
 
 if __name__ == "__main__":
     main()
