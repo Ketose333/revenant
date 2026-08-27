@@ -59,7 +59,6 @@ def fetch_cdx(query_pattern, headers=DEFAULT_HEADERS, tries=5):
     return []
 
 ROOT = Path(__file__).resolve().parent
-SITES_DIR = ROOT / "sites"
 POLICY_PATH = ROOT / "policy.json"
 
 COMMON_CRAWL_INDEXES = (
@@ -81,15 +80,44 @@ def load_policy():
     with open(POLICY_PATH, encoding="utf-8") as f:
         return json.load(f)
 
-def site_paths(site_id):
-    base = SITES_DIR / site_id
-    return {
+def resolve_data_root(cli_value=None):
+    """CLI, 환경변수, 저장소 기본값 순으로 데이터 루트를 결정한다."""
+    value = cli_value if cli_value is not None else os.environ.get("ARCHIVES_DATA_ROOT")
+    return Path(value or ROOT / "data").expanduser().resolve()
+
+
+def is_link_or_reparse(path):
+    """기존 심볼릭 링크와 Windows reparse point를 식별한다."""
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return path.is_symlink() or bool(
+        getattr(info, "st_file_attributes", 0) & 0x400
+    )
+
+
+def site_paths(site_id, data_root=None):
+    if not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+){0,2}", site_id):
+        raise ValueError(f"올바르지 않은 site id: {site_id}")
+    root = resolve_data_root(data_root)
+    base = root / "sites" / site_id
+    paths = {
         "base": base,
         "files": base / "files",
         "captures": base / "captures",
         "inventory": base / "inventory.json",
         "viewer": base / "viewer.html",
     }
+    for path in paths.values():
+        if is_link_or_reparse(path):
+            raise ValueError(f"관리 경로의 링크 또는 reparse point는 허용하지 않는다: {path}")
+    try:
+        base.resolve().relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"사이트 경로가 data root 밖을 가리킨다: {base}") from error
+    return paths
 
 def fetch_cdx_domain(domain, headers=DEFAULT_HEADERS, tries=5):
     """도메인 하나를 matchType=domain으로 한 번에 훑는다.
@@ -171,9 +199,9 @@ def preserve_common_crawl_inventory(inventory, previous, files_root):
     totals["saved"] = sum(1 for asset in inventory["assets"] if asset["local"] == "saved")
     return inventory
 
-def survey_site(site_id, domains):
+def survey_site(site_id, domains, data_root=None):
     """CDX 색인만 읽어 경로를 전수 조사한다. 바이트는 내려받지 않는다."""
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     paths["base"].mkdir(parents=True, exist_ok=True)
     previous = {}
     if paths["inventory"].exists():
@@ -207,9 +235,8 @@ def survey_site(site_id, domains):
     # (과거 실행이 일부 파일을 루트에 평평하게 저장해 파일명 대체가 필요하다)
     unclaimed = {}
     if paths["files"].exists():
-        for f in paths["files"].rglob("*"):
-            if f.is_file():
-                unclaimed[f.relative_to(paths["files"]).as_posix()] = f.name
+        for relative, safe in iter_safe_files(paths["files"]):
+            unclaimed[relative.as_posix()] = safe.name
 
     def local_rel(p):
         rel = p.lstrip("/")
@@ -307,8 +334,19 @@ def url_relative_path(original):
 
 def safe_destination(root, relative):
     """최종 저장 위치가 원본 루트 안인지 symlink까지 해석해 확인한다."""
-    root = Path(root).resolve()
-    target = (root / Path(relative)).resolve()
+    root_path = Path(root)
+    relative_path = Path(relative)
+    if relative_path.is_absolute():
+        raise ValueError(f"절대경로에는 저장하지 않는다: {relative_path}")
+    if is_link_or_reparse(root_path):
+        raise ValueError(f"저장 루트의 링크 또는 reparse point는 허용하지 않는다: {root_path}")
+    current = root_path
+    for part in relative_path.parts:
+        current /= part
+        if is_link_or_reparse(current):
+            raise ValueError(f"저장 경로의 링크 또는 reparse point는 허용하지 않는다: {current}")
+    root = root_path.resolve()
+    target = current.resolve()
     try:
         target.relative_to(root)
     except ValueError as e:
@@ -316,6 +354,19 @@ def safe_destination(root, relative):
     if target == root:
         raise ValueError(f"파일 저장 경로가 아니다: {target}")
     return target
+
+
+def iter_safe_files(root, pattern="*"):
+    """root 아래 열거 결과를 상대경로로 바꾼 뒤 링크 안전성을 재검증한다."""
+    root = Path(root)
+    for candidate in root.rglob(pattern):
+        try:
+            relative = candidate.relative_to(root)
+            safe = safe_destination(root, relative)
+        except ValueError:
+            continue
+        if safe.is_file():
+            yield relative, safe
 
 def fetch_common_crawl_index(domain, index, headers=DEFAULT_HEADERS, tries=5):
     """Common Crawl 구형 CDXJ 색인에서 성공 응답만 읽는다."""
@@ -416,7 +467,7 @@ def write_new_bytes(dest, data, root=None):
     except FileExistsError:
         return dest.read_bytes() == data
 
-def refetch_verified(path, snapshots, dest, tries=4):
+def refetch_verified(path, snapshots, dest, tries=4, root=None):
     """아카이브에서 다시 받되, 지문이 기록과 맞을 때만 파일을 교체한다.
 
     맞지 않으면 아무것도 쓰지 않는다. 원본 폴더에 검증 안 된 바이트를 남기지 않기 위함이다.
@@ -437,19 +488,26 @@ def refetch_verified(path, snapshots, dest, tries=4):
             if got != snap["digest"]:
                 print(f"    [건너뜀] {snap['timestamp']} 지문 불일치 (기록 {snap['digest']} / 수신 {got})")
                 break
+            if root is not None:
+                try:
+                    relative = Path(dest).relative_to(Path(root))
+                    dest = safe_destination(root, relative)
+                except ValueError as error:
+                    print(f"    [건너뜀] 안전하지 않은 저장 경로: {error}")
+                    return None
             dest.parent.mkdir(parents=True, exist_ok=True)
             with open(dest, "wb") as f:
                 f.write(data)
             return snap["timestamp"], len(data), got
     return None
 
-def verify_site(site_id, domains, repair=False):
+def verify_site(site_id, domains, repair=False, data_root=None):
     """files/의 바이트가 아카이브 기록과 같은지 대조한다.
 
     repair=False면 파일을 건드리지 않는다. repair=True면 지문이 틀린 파일만
     다시 받아 교체하되, 받은 바이트의 지문이 기록과 맞을 때만 쓴다.
     """
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     if not paths["files"].exists():
         print(f"[!] 원본 폴더가 없다: {paths['files']}")
         return None
@@ -480,10 +538,8 @@ def verify_site(site_id, domains, repair=False):
     for p in snaps:
         snaps[p].sort(key=lambda x: x.get("timestamp", ""), reverse=True)
 
-    local = sorted(
-        f for f in paths["files"].rglob("*") if f.is_file()
-    )
-    by_rel = {f.relative_to(paths["files"]).as_posix(): f for f in local}
+    local = sorted(iter_safe_files(paths["files"]), key=lambda item: item[0].as_posix())
+    by_rel = {relative.as_posix(): safe for relative, safe in local}
     by_name = collections.defaultdict(list)
     for rel, f in by_rel.items():
         by_name[Path(rel).name].append(rel)
@@ -529,7 +585,15 @@ def verify_site(site_id, domains, repair=False):
         print(f"\n[*] 불일치 {len(mismatch)}건 재수신 (지문이 맞을 때만 교체)")
         for rel, p in mismatch:
             print(f"  {rel}")
-            got = refetch_verified(p, snaps.get(p, []), paths["files"] / rel)
+            try:
+                destination = safe_destination(paths["files"], rel)
+            except ValueError as error:
+                print(f"    [건너뜀] 안전하지 않은 저장 경로: {error}")
+                failed.append(rel)
+                continue
+            got = refetch_verified(
+                p, snaps.get(p, []), destination, root=paths["files"]
+            )
             if got:
                 ts, size, dg = got
                 print(f"    [교체] {ts} {size} bytes 지문={dg}")
@@ -544,9 +608,9 @@ def verify_site(site_id, domains, repair=False):
         "repaired": repaired, "failed": failed,
     }
 
-def update_common_crawl_inventory(site_id, domains, indexes, records, captures):
+def update_common_crawl_inventory(site_id, domains, indexes, records, captures, data_root=None):
     """Common Crawl 조사·다운로드 결과를 inventory.json에 재현 가능하게 기록한다."""
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     inventory = {}
     if paths["inventory"].exists():
         with open(paths["inventory"], encoding="utf-8") as f:
@@ -627,9 +691,10 @@ def update_common_crawl_inventory(site_id, domains, indexes, records, captures):
     print(f"[+] Common Crawl 기록: {paths['inventory']}")
     return inventory
 
-def restore_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, max_workers=3, delay=0.15):
+def restore_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, max_workers=3,
+                         delay=0.15, data_root=None):
     """Common Crawl ARC에서 검증된 HTTP payload 원본을 복원한다."""
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     paths["files"].mkdir(parents=True, exist_ok=True)
     paths["captures"].mkdir(parents=True, exist_ok=True)
     records = fetch_common_crawl_records(domains, indexes)
@@ -701,16 +766,18 @@ def restore_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, max_wor
             "digest": record["digest"],
             "bytes": size,
         })
-    update_common_crawl_inventory(site_id, domains, indexes, records, captures)
+    update_common_crawl_inventory(
+        site_id, domains, indexes, records, captures, data_root=data_root
+    )
     saved = sum(1 for _, status, _, _, _ in results if status in ("saved", "variant_saved"))
     existing = sum(1 for _, status, _, _, _ in results if "existing" in status)
     failed = sum(1 for _, status, _, _, _ in results if status == "failed")
     print(f"[+] Common Crawl 완료: 신규 {saved} / 기존확인 {existing} / 실패 {failed}")
     return {"saved": saved, "existing": existing, "failed": failed, "captures": captures}
 
-def verify_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES):
+def verify_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES, data_root=None):
     """Common Crawl 캡처 지문과 로컬 원본을 읽기 전용으로 대조한다."""
-    paths = site_paths(site_id)
+    paths = site_paths(site_id, data_root=data_root)
     records = fetch_common_crawl_records(domains, indexes)
     if records is None:
         print("[!] 색인이 반쪽이므로 대조를 중단한다")
@@ -725,7 +792,14 @@ def verify_common_crawl(site_id, domains, indexes=COMMON_CRAWL_INDEXES):
         candidates = [natural] if natural.is_file() else []
         variants = paths["captures"] / "common_crawl"
         if variants.exists():
-            candidates.extend(p for p in variants.glob(f"*/{rel}") if p.is_file())
+            for candidate in variants.glob(f"*/{rel}"):
+                try:
+                    relative = candidate.relative_to(paths["captures"])
+                    safe = safe_destination(paths["captures"], relative)
+                except ValueError:
+                    continue
+                if safe.is_file():
+                    candidates.append(safe)
         if not candidates:
             absent.append(rel)
         elif any(payload_digest(candidate) in digests for candidate in candidates):
@@ -765,11 +839,11 @@ def restore_domain(domains, output_dir, max_workers=3, delay=0.15):
     for r in all_cdx:
         if r.get("statuscode", "") != "200":
             continue
-        parsed = urllib.parse.urlparse(clean_url(r.get("original", "")))
-        rel = decode_path_safe(parsed.path.lstrip("/"))
-        if not rel or rel.endswith("/"):
-            rel = rel + "index.html"
-        rel = rel.replace("\\", "/").strip("/")
+        try:
+            rel = url_relative_path(r.get("original", ""))
+        except ValueError as error:
+            print(f"  [건너뜀] {error}")
+            continue
         targets_map.setdefault(rel, []).append(r)
 
     for rel in targets_map:
@@ -780,12 +854,12 @@ def restore_domain(domains, output_dir, max_workers=3, delay=0.15):
     # 3. 다운로드 함수 — 지문이 기록과 맞을 때만 기록한다
     def download_file(item):
         rel, snaps = item
-        dest_file = out_path / Path(rel)
+        dest_file = safe_destination(out_path, rel)
         if dest_file.exists() and dest_file.stat().st_size > 0:
             return rel, True, "기존 파일 존재", dest_file.stat().st_size
 
         time.sleep(delay)
-        got = refetch_verified(rel, snaps, dest_file, tries=3)
+        got = refetch_verified(rel, snaps, dest_file, tries=3, root=out_path)
         if got:
             ts, size, _ = got
             return rel, True, f"성공 ({ts})", size
@@ -850,8 +924,15 @@ def generate_viewer(target_dir, out_path, max_dim=None):
     if not p_dir.exists():
         print(f"[!] 디렉터리가 존재하지 않습니다: {target_dir}")
         return
+    if is_link_or_reparse(p_dir):
+        print(f"[!] 링크 또는 reparse point는 뷰어 원본으로 사용하지 않습니다: {target_dir}")
+        return
+    p_dir = p_dir.resolve()
 
-    all_files = [f for f in p_dir.glob("**/*.*") if f.name != "archive_viewer.html"]
+    all_files = [
+        safe for relative, safe in iter_safe_files(p_dir, "*.*")
+        if relative.name != "archive_viewer.html"
+    ]
     images = [f for f in all_files if f.suffix.lower() in IMG_MIME]
     flash = [f for f in all_files if f.suffix.lower() == ".swf"]
     pages = [f for f in all_files if f.suffix.lower() in [".htm", ".html"]]
@@ -897,17 +978,28 @@ def generate_viewer(target_dir, out_path, max_dim=None):
     </section>""")
     sections_html = "\n".join(sections)
 
-    pages_html = "\n".join(
-        f'      <a class="page-item" href="{p.relative_to(p_dir).as_posix()}" target="_blank">'
-        f'<span class="page-title">{html_mod.escape(p.name)}</span>'
-        f'<span class="page-path">{p.relative_to(p_dir).as_posix()} ({p.stat().st_size/1024:.1f} KB)</span></a>'
-        for p in pages
-    )
-    flash_html = "\n".join(
-        f'      <div class="page-item flash-item"><span class="page-title">{html_mod.escape(f.name)}</span>'
-        f'<span class="page-path">{f.relative_to(p_dir).as_posix()} · Flash(.swf), 브라우저 미리보기 불가</span></div>'
-        for f in flash
-    )
+    page_rows = []
+    for page in pages:
+        relative = page.relative_to(p_dir).as_posix()
+        href = urllib.parse.quote(relative, safe="/")
+        shown = html_mod.escape(relative)
+        page_rows.append(
+            f'      <a class="page-item" href="{href}" target="_blank" rel="noopener noreferrer">'
+            f'<span class="page-title">{html_mod.escape(page.name)}</span>'
+            f'<span class="page-path">{shown} ({page.stat().st_size/1024:.1f} KB)</span></a>'
+        )
+    pages_html = "\n".join(page_rows)
+
+    flash_rows = []
+    for item in flash:
+        relative = item.relative_to(p_dir).as_posix()
+        flash_rows.append(
+            f'      <div class="page-item flash-item">'
+            f'<span class="page-title">{html_mod.escape(item.name)}</span>'
+            f'<span class="page-path">{html_mod.escape(relative)} · '
+            f'Flash(.swf), 브라우저 미리보기 불가</span></div>'
+        )
+    flash_html = "\n".join(flash_rows)
 
     viewer_html = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -1022,6 +1114,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Wayback Machine 아카이브 전수조사·복원 툴킷 (sites/<id>/ 단위로 동작)"
     )
+    parser.add_argument(
+        "--data-root", type=Path,
+        help="조사 데이터 루트 (기본: ARCHIVES_DATA_ROOT 또는 저장소의 data 폴더)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     survey_parser = subparsers.add_parser(
@@ -1057,14 +1153,15 @@ def main():
                                help="Common Crawl 인덱스 목록")
 
     args = parser.parse_args()
-    paths = site_paths(args.site)
+    data_root = resolve_data_root(args.data_root)
+    paths = site_paths(args.site, data_root=data_root)
 
     if args.command == "survey":
-        survey_site(args.site, args.domains)
+        survey_site(args.site, args.domains, data_root=data_root)
     elif args.command == "download":
         if args.archive == "common_crawl":
             restore_common_crawl(args.site, args.domains, indexes=args.cc_indexes,
-                                 max_workers=args.threads)
+                                 max_workers=args.threads, data_root=data_root)
         else:
             restore_domain(args.domains, paths["files"], max_workers=args.threads)
         generate_viewer(paths["files"], out_path=paths["viewer"])
@@ -1074,9 +1171,11 @@ def main():
         if args.archive == "common_crawl":
             if args.repair:
                 parser.error("Common Crawl verify는 --repair를 지원하지 않는다. download를 다시 실행할 것")
-            verify_common_crawl(args.site, args.domains, indexes=args.cc_indexes)
+            verify_common_crawl(
+                args.site, args.domains, indexes=args.cc_indexes, data_root=data_root
+            )
         else:
-            verify_site(args.site, args.domains, repair=args.repair)
+            verify_site(args.site, args.domains, repair=args.repair, data_root=data_root)
 
 if __name__ == "__main__":
     main()
