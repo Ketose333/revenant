@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+.env
+.env.*
+!.env.example
+
+# 실제 조사 데이터와 자동 생성물은 공개 저장소에 두지 않는다.
+sites/
+data/
+docs/STATUS.md
+inventory.json
+viewer.html
+files/
+captures/

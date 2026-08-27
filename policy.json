@@ -1,0 +1,31 @@
+{
+  "asset_kind_values": [
+    "page",
+    "image",
+    "flash",
+    "style",
+    "script",
+    "document",
+    "other"
+  ],
+  "archive_source_values": [
+    "wayback",
+    "common_crawl"
+  ],
+  "local_status_values": [
+    "saved",
+    "absent"
+  ],
+  "recovery_scale": {
+    "recoverable": "200 스냅샷이 있어 원본 바이트를 받을 수 있음",
+    "hotlink_blocked": "원본 서버가 핫링크를 차단해 아카이브 봇도 403만 받아감. 실제 바이트가 아카이브에 없음",
+    "not_found": "404 스냅샷만 있어 수집 시점에 이미 삭제된 경로",
+    "redirect_only": "301·302 스냅샷만 있어 본문 바이트가 없음",
+    "unknown": "위 어디에도 해당하지 않는 상태코드만 기록됨"
+  },
+  "survey_status_scale": {
+    "surveyed": "CDX 색인을 전수 조회해 경로 목록을 확정함",
+    "no_public_surface": "도메인 소멸 등으로 아카이브 색인과 실서비스 모두 조사할 표면이 없음"
+  },
+  "schema_version": "1.0.0"
+}
