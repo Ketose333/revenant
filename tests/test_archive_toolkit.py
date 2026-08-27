@@ -340,3 +340,115 @@ def test_viewer_link_blocked(link_kind, tmp_path, monkeypatch):
         assert base64.b64encode(b"private-image").decode("ascii") not in rendered
     finally:
         remove_directory_link(link)
+
+
+def make_swf(tags, compressed=False):
+    """DefineBitsJPEG2 등을 담은 최소 SWF를 만든다."""
+    import struct
+    body = bytearray()
+    body += bytes([0x00])          # RECT: nbits=0
+    body += struct.pack("<HH", 0x0C00, 1)   # framerate, framecount
+    for code, payload in tags:
+        if len(payload) < 0x3F:
+            body += struct.pack("<H", (code << 6) | len(payload))
+        else:
+            body += struct.pack("<H", (code << 6) | 0x3F)
+            body += struct.pack("<I", len(payload))
+        body += payload
+    body += struct.pack("<H", 0)   # End tag
+    body = bytes(body)
+    if compressed:
+        import zlib
+        payload = zlib.compress(body)
+        head = b"CWS\x06" + struct.pack("<I", 8 + len(body))
+        return head + payload
+    head = b"FWS\x06" + struct.pack("<I", 8 + len(body))
+    return head + body
+
+
+def jpeg_bytes(marker=b"\xff\xe0"):
+    return b"\xff\xd8" + marker + b"\x00\x10JFIF" + b"\x00" * 2000 + b"\xff\xd9"
+
+
+def test_swf_images_extracted(tmp_path):
+    import struct
+    image = jpeg_bytes()
+    payload = struct.pack("<H", 1) + b"\xff\xd9\xff\xd8" + image
+    source = tmp_path / "movie.swf"
+    source.write_bytes(make_swf([(21, payload)]))
+    out = tmp_path / "out"
+    saved = toolkit.extract_swf_images(source, out)
+    assert len(saved) == 1
+    assert saved[0].read_bytes() == image
+
+
+def test_swf_separator_stripped(tmp_path):
+    """DefineBitsJPEG2의 FFD9FFD8 구분자에서 자르면 안 된다."""
+    import struct
+    image = jpeg_bytes()
+    payload = struct.pack("<H", 1) + b"\xff\xd9\xff\xd8" + image
+    source = tmp_path / "movie.swf"
+    source.write_bytes(make_swf([(21, payload)]))
+    saved = toolkit.extract_swf_images(source, tmp_path / "out")
+    data = saved[0].read_bytes()
+    assert data.startswith(b"\xff\xd8")
+    assert data.count(b"\xff\xd9") == 1
+
+
+def test_swf_compressed_read(tmp_path):
+    import struct
+    image = jpeg_bytes()
+    payload = struct.pack("<H", 1) + image
+    source = tmp_path / "movie.swf"
+    source.write_bytes(make_swf([(21, payload)], compressed=True))
+    saved = toolkit.extract_swf_images(source, tmp_path / "out")
+    assert len(saved) == 1
+
+
+def test_extract_output_scoped(tmp_path):
+    """추출 결과는 원본 폴더 안에 쓰지 않는다."""
+    files = tmp_path / "sites" / "sample" / "files"
+    files.mkdir(parents=True)
+    (files / "movie.swf").write_bytes(make_swf([]))
+    with pytest.raises(ValueError):
+        toolkit.extract_site_images("sample", out_dir=files / "out", data_root=tmp_path)
+
+
+def test_extract_site_collected(tmp_path):
+    """사이트의 SWF 전부에서 이미지를 모은다."""
+    import struct
+    files = tmp_path / "sites" / "sample" / "files"
+    files.mkdir(parents=True)
+    payload = struct.pack("<H", 1) + jpeg_bytes()
+    (files / "a.swf").write_bytes(make_swf([(21, payload)]))
+    (files / "b.swf").write_bytes(make_swf([(21, payload)]))
+    saved = toolkit.extract_site_images("sample", data_root=tmp_path)
+    assert len(saved) == 2
+    assert all(path.parent.name == "extracted" for path in saved)
+
+
+def png_bytes(size=(120, 90)):
+    """min_bytes 필터를 넘도록 압축되지 않는 노이즈 이미지를 만든다."""
+    Image = pytest.importorskip("PIL.Image")
+    buffer = io.BytesIO()
+    pixels = os.urandom(size[0] * size[1] * 3)
+    Image.frombytes("RGB", size, pixels).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_sheet_pages_written(tmp_path):
+    files = tmp_path / "sites" / "sample" / "files"
+    files.mkdir(parents=True)
+    for index in range(3):
+        (files / f"shot{index}.png").write_bytes(png_bytes())
+    sheets = toolkit.build_contact_sheets("sample", data_root=tmp_path, columns=2, rows=1)
+    assert len(sheets) == 2          # 3장이 2×1 시트 두 장에 나뉜다
+    assert all(path.is_file() for path in sheets)
+
+
+def test_sheet_output_scoped(tmp_path):
+    files = tmp_path / "sites" / "sample" / "files"
+    files.mkdir(parents=True)
+    (files / "shot.png").write_bytes(png_bytes())
+    with pytest.raises(ValueError):
+        toolkit.build_contact_sheets("sample", out_dir=files / "sheets", data_root=tmp_path)

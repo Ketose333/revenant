@@ -19,6 +19,8 @@ import urllib.request
 import urllib.parse
 import re
 import gzip
+import struct
+import zlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1110,6 +1112,183 @@ def generate_viewer(target_dir, out_path, max_dim=None):
         f.write(viewer_html)
     print(f"[+] 뷰어 파일 생성 완료: {out_file.resolve()} ({out_file.stat().st_size/1024/1024:.2f} MB)")
 
+# --- SWF 내장 이미지 추출 -------------------------------------------------
+#
+# 2000년대 사이트는 갤러리·메뉴를 통째로 Flash에 넣은 경우가 많다. HTML만 봐서는
+# 내용을 알 수 없으므로 SWF 안의 원본 이미지를 꺼내 판독한다.
+
+SWF_IMAGE_TAGS = (6, 21, 35, 90)   # DefineBits, JPEG2, JPEG3, JPEG4
+SWF_JPEG_TABLE_TAG = 8             # JPEGTables
+
+
+def swf_body(raw):
+    """SWF 헤더를 벗기고 태그 스트림을 돌려준다. 지원하지 않으면 None."""
+    signature = raw[:3]
+    if signature == b"FWS":
+        return raw[8:]
+    if signature == b"CWS":
+        try:
+            return zlib.decompress(raw[8:])
+        except zlib.error:
+            return None
+    return None            # ZWS(LZMA)는 표준 라이브러리로 풀 수 없다
+
+
+def swf_tags(body):
+    """(코드, 페이로드) 순으로 태그를 훑는다."""
+    nbits = body[0] >> 3
+    index = (5 + 4 * nbits + 7) // 8 + 4      # RECT + framerate + framecount
+    while index + 2 <= len(body):
+        (header,) = struct.unpack_from("<H", body, index)
+        index += 2
+        code, length = header >> 6, header & 0x3F
+        if length == 0x3F:
+            (length,) = struct.unpack_from("<I", body, index)
+            index += 4
+        yield code, body[index:index + length]
+        index += length
+        if code == 0:
+            break
+
+
+def strip_jpeg_separator(data):
+    """DefineBitsJPEG2/3이 데이터 앞에 넣는 FFD9FFD8 구분자를 걷어낸다.
+
+    이걸 놓치고 FFD8~FFD9로 단순히 자르면 첫 FFD9에서 끊겨 전부 깨진 파일이 된다.
+    """
+    if data[:4] == b"\xff\xd8\xff\xd9":
+        data = data[4:]
+    return data.replace(b"\xff\xd9\xff\xd8", b"", 1)
+
+
+def swf_tag_image(code, payload, jpeg_table):
+    """이미지 태그 하나에서 JPEG 바이트를 만든다. 이미지가 아니면 None."""
+    if code == 6:
+        body = strip_jpeg_separator(payload[2:])
+        return (jpeg_table[:-2] + body[2:]) if jpeg_table else body
+    if code == 21:
+        return strip_jpeg_separator(payload[2:])
+    offset = 2 if code == 35 else 3
+    (length,) = struct.unpack_from("<I", payload, offset)
+    start = offset + 4
+    return strip_jpeg_separator(payload[start:start + length])
+
+
+def extract_swf_images(source, out_dir, min_bytes=1500):
+    """SWF 하나에서 내장 JPEG을 꺼내 out_dir에 저장하고 저장 경로를 돌려준다."""
+    source = Path(source)
+    out_dir = Path(out_dir)
+    body = swf_body(source.read_bytes())
+    if body is None:
+        return []
+    saved = []
+    jpeg_table = b""
+    index = 0
+    for code, payload in swf_tags(body):
+        if code == SWF_JPEG_TABLE_TAG:
+            jpeg_table = strip_jpeg_separator(payload)
+            continue
+        if code not in SWF_IMAGE_TAGS:
+            continue
+        try:
+            image = swf_tag_image(code, payload, jpeg_table)
+        except struct.error:
+            continue
+        if not image or image[:2] != b"\xff\xd8" or len(image) < min_bytes:
+            continue
+        index += 1
+        out_dir.mkdir(parents=True, exist_ok=True)
+        destination = out_dir / f"{source.stem}_{index:02d}.jpg"
+        destination.write_bytes(image)
+        saved.append(destination)
+    return saved
+
+
+def extract_site_images(site_id, out_dir=None, data_root=None):
+    """사이트의 files/ 아래 모든 SWF에서 이미지를 꺼낸다."""
+    paths = site_paths(site_id, data_root=data_root)
+    out_dir = Path(out_dir) if out_dir else Path(paths["base"]) / "extracted"
+    files_root = Path(paths["files"]).resolve()
+    resolved = out_dir.resolve()
+    if resolved == files_root or files_root in resolved.parents:
+        raise ValueError(f"원본 폴더 안에는 추출하지 않는다: {out_dir}")
+    total = []
+    for _, source in sorted(iter_safe_files(paths["files"], "*.swf")):
+        saved = extract_swf_images(source, out_dir)
+        print(f"  {source.name}: 이미지 {len(saved)}개")
+        total.extend(saved)
+    print(f"[+] 추출 {len(total)}개 -> {out_dir}")
+    return total
+
+
+# --- 컨택트시트 -----------------------------------------------------------
+#
+# 복구한 이미지가 수백 장이면 한 장씩 열어보는 것은 비효율적이다. 파일명을 붙인
+# 격자 시트로 묶어 한눈에 훑고, 볼 것만 원본으로 다시 연다.
+
+SHEET_SUFFIXES = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
+
+
+def build_contact_sheets(site_id, out_dir=None, data_root=None,
+                         columns=6, rows=5, cell=230, min_bytes=1500):
+    """사이트의 이미지들을 파일명 라벨이 붙은 격자 시트로 묶는다."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        raise RuntimeError("컨택트시트에는 Pillow가 필요하다") from None
+
+    paths = site_paths(site_id, data_root=data_root)
+    out_dir = Path(out_dir) if out_dir else Path(paths["base"]) / "sheets"
+    files_root = Path(paths["files"]).resolve()
+    resolved = out_dir.resolve()
+    if resolved == files_root or files_root in resolved.parents:
+        raise ValueError(f"원본 폴더 안에는 시트를 만들지 않는다: {out_dir}")
+
+    sources = [
+        (relative, absolute)
+        for relative, absolute in sorted(iter_safe_files(paths["files"]))
+        if absolute.suffix.lower() in SHEET_SUFFIXES
+        and absolute.stat().st_size >= min_bytes
+    ]
+    if not sources:
+        print("[+] 시트로 만들 이미지가 없다")
+        return []
+
+    try:
+        font = ImageFont.truetype("consola.ttf", 11)
+    except OSError:
+        font = ImageFont.load_default()
+
+    label = 16
+    per_sheet = columns * rows
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for index in range(0, len(sources), per_sheet):
+        chunk = sources[index:index + per_sheet]
+        sheet = Image.new("RGB", (columns * cell, rows * (cell + label)), "white")
+        draw = ImageDraw.Draw(sheet)
+        for slot, (relative, absolute) in enumerate(chunk):
+            left = (slot % columns) * cell
+            top = (slot // columns) * (cell + label)
+            try:
+                with Image.open(absolute) as image:
+                    thumb = image.convert("RGB")
+                    thumb.thumbnail((cell - 6, cell - 6))
+                    sheet.paste(thumb, (left + (cell - thumb.width) // 2,
+                                        top + (cell - thumb.height) // 2))
+            except OSError:
+                draw.text((left + 4, top + 4), "ERR", fill="red", font=font)
+            name = relative.as_posix()
+            draw.text((left + 2, top + cell + 2), name[-36:], fill="black", font=font)
+            draw.rectangle([left, top, left + cell - 1, top + cell + label - 1],
+                           outline=(200, 200, 200))
+        destination = out_dir / f"sheet_{len(written) + 1:02d}.png"
+        sheet.save(destination)
+        written.append(destination)
+    print(f"[+] 이미지 {len(sources)}장 -> 시트 {len(written)}장 ({out_dir})")
+    return written
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Wayback Machine 아카이브 전수조사·복원 툴킷 (sites/<id>/ 단위로 동작)"
@@ -1134,6 +1313,23 @@ def main():
                              help="원본 아카이브 (기본값: wayback)")
     down_parser.add_argument("--cc-indexes", nargs="+", default=list(COMMON_CRAWL_INDEXES),
                              help="Common Crawl 인덱스 목록")
+
+    extract_parser = subparsers.add_parser(
+        "extract", help="files/의 SWF에서 내장 이미지를 꺼낸다 (원본은 불변)"
+    )
+    extract_parser.add_argument("--site", "-s", required=True, help="사이트 id")
+    extract_parser.add_argument("--out-dir", type=Path, default=None,
+                                help="추출 위치 (기본: sites/<id>/extracted, files/ 안은 거부)")
+
+    sheet_parser = subparsers.add_parser(
+        "sheet", help="files/의 이미지를 파일명 라벨이 붙은 컨택트시트로 묶는다"
+    )
+    sheet_parser.add_argument("--site", "-s", required=True, help="사이트 id")
+    sheet_parser.add_argument("--out-dir", type=Path, default=None,
+                              help="시트 위치 (기본: sites/<id>/sheets, files/ 안은 거부)")
+    sheet_parser.add_argument("--columns", type=int, default=6, help="시트 가로 칸 수 (기본값: 6)")
+    sheet_parser.add_argument("--rows", type=int, default=5, help="시트 세로 칸 수 (기본값: 5)")
+    sheet_parser.add_argument("--cell", type=int, default=230, help="칸 한 변의 픽셀 (기본값: 230)")
 
     view_parser = subparsers.add_parser("view", help="사이트의 자체완결 뷰어 HTML을 재생성한다")
     view_parser.add_argument("--site", "-s", required=True, help="사이트 id (sites/<id>/viewer.html 생성)")
@@ -1165,6 +1361,11 @@ def main():
         else:
             restore_domain(args.domains, paths["files"], max_workers=args.threads)
         generate_viewer(paths["files"], out_path=paths["viewer"])
+    elif args.command == "extract":
+        extract_site_images(args.site, out_dir=args.out_dir, data_root=data_root)
+    elif args.command == "sheet":
+        build_contact_sheets(args.site, out_dir=args.out_dir, data_root=data_root,
+                             columns=args.columns, rows=args.rows, cell=args.cell)
     elif args.command == "view":
         generate_viewer(paths["files"], out_path=paths["viewer"], max_dim=args.max_dim)
     elif args.command == "verify":

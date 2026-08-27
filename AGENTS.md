@@ -5,7 +5,7 @@
 ## 구조
 
 ```text
-archive_toolkit.py          # survey / download / view / verify 실행 진입점
+archive_toolkit.py          # survey / download / extract / sheet / view / verify 실행 진입점
 policy.json                 # 판정·상태값 단일 정책
 tests/
 └── test_archive_toolkit.py # 경로·원본 검증 단위 테스트
@@ -16,6 +16,8 @@ tests/
         ├── inventory.json  # 조사 결과와 아카이브 메타데이터
         ├── files/          # 내려받은 원본 바이트
         ├── captures/       # 동일 경로의 다른 시점 원본
+        ├── extracted/      # SWF에서 꺼낸 내장 이미지 (파생물)
+        ├── sheets/         # 판독용 컨택트시트 (파생물)
         └── viewer.html     # 자체완결 뷰어
 ```
 
@@ -31,6 +33,9 @@ tests/
 - `files/`는 원본 전용이며 다운로드한 바이트를 재인코딩하거나 덮어쓰지 않는다.
 - 같은 URL 경로의 아카이브별 바이트가 다르면 `captures/<archive>/<timestamp>/`에 분리한다.
 - 뷰어 출력은 `files/` 밖에 두며, 도구는 원본 폴더 내부 출력을 거부해야 한다.
+- `extract`·`sheet`의 출력도 같다. `extracted/`·`sheets/`는 원본에서 만든 파생물이므로 `files/` 밖에 둔다.
+- SWF에서 이미지를 꺼낼 때 `FFD8`~`FFD9` 단순 절단을 쓰지 않는다. `DefineBitsJPEG2/3`가 데이터 앞에
+  `FFD9FFD8` 구분자를 넣어 첫 `FFD9`에서 끊기므로 태그를 파싱해 구분자를 걷어낸다.
 - 코드와 문서의 예시에는 실제 조사 대상의 인물명, 도메인, site id를 사용하지 않는다.
 
 ## 변경 및 검증

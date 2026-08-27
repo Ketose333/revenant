@@ -39,6 +39,8 @@ Wayback Machine과 Common Crawl의 공개 색인을 조사하고, 보존된 원�
 ```powershell
 python archive_toolkit.py --data-root D:\private\archive survey --site sample --domains example.test
 python archive_toolkit.py --data-root D:\private\archive download --site sample --domains example.test
+python archive_toolkit.py --data-root D:\private\archive extract --site sample
+python archive_toolkit.py --data-root D:\private\archive sheet --site sample
 python archive_toolkit.py --data-root D:\private\archive view --site sample
 python archive_toolkit.py --data-root D:\private\archive verify --site sample --domains example.test
 ```
@@ -53,6 +55,12 @@ python archive_toolkit.py survey --site sample --domains example.test
 Common Crawl을 명시하려면 `download` 또는 `verify`에 `--archive common_crawl`을 추가합니다.
 
 `survey`는 색인만 조회하고 원본 바이트를 내려받지 않습니다. `download`는 기존 파일을 덮어쓰지 않으며, `verify`는 기록된 SHA-1 지문과 로컬 바이트를 비교합니다. `view`는 `files/`의 자료로 자체완결 HTML 뷰어를 생성합니다.
+
+`extract`는 `files/`의 SWF에서 내장 JPEG을 꺼내 `extracted/`에 저장합니다. 2000년대 사이트는 갤러리와 메뉴를 통째로 Flash에 넣은 경우가 많아 HTML만으로는 내용을 알 수 없습니다. `FFD8`~`FFD9`로 단순히 잘라내면 `DefineBitsJPEG2/3`가 데이터 앞에 넣는 `FFD9FFD8` 구분자에서 끊겨 깨진 파일이 나오므로, 태그 구조를 파싱해 그 구분자를 걷어냅니다.
+
+`sheet`는 `files/`의 이미지를 파일명 라벨이 붙은 격자 시트로 묶어 `sheets/`에 저장합니다. 복구한 이미지가 수백 장일 때 한 장씩 여는 대신 시트로 훑고 볼 것만 원본으로 다시 엽니다. Pillow가 필요합니다.
+
+`extract`와 `sheet`는 결과를 `files/` 안에 쓰지 않습니다. `files/`는 아카이브 원본 전용이며, 출력 경로가 그 안이면 거부합니다.
 
 ## 테스트
 
