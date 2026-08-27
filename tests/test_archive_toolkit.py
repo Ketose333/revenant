@@ -1,8 +1,11 @@
 import base64
 import gzip
 import hashlib
+import os
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -85,33 +88,167 @@ def test_site_id_rejected(site_id, tmp_path):
         toolkit.site_paths(site_id, data_root=tmp_path)
 
 
-@pytest.mark.parametrize("command", ["survey", "download", "view", "verify"])
-def test_cli_root_forwarded(command, tmp_path, monkeypatch):
-    received = {}
+@pytest.mark.parametrize(
+    "command,target,archive_args",
+    [
+        ("survey", "survey_site", []),
+        ("verify", "verify_site", []),
+        ("download", "restore_common_crawl", ["--archive", "common_crawl"]),
+        ("verify", "verify_common_crawl", ["--archive", "common_crawl"]),
+    ],
+)
+def test_cli_root_forwarded(command, target, archive_args, tmp_path, monkeypatch):
     root = tmp_path / "external"
+    command_mock = Mock()
+    monkeypatch.setattr(toolkit, target, command_mock)
+    monkeypatch.setattr(toolkit, "generate_viewer", Mock())
 
-    def record_paths(site_id, data_root=None):
-        received["root"] = data_root
-        base = Path(data_root) / "sites" / site_id
-        return {
-            "base": base,
-            "files": base / "files",
-            "captures": base / "captures",
-            "inventory": base / "inventory.json",
-            "viewer": base / "viewer.html",
-        }
-
-    monkeypatch.setattr(toolkit, "site_paths", record_paths)
-    monkeypatch.setattr(toolkit, "survey_site", lambda *args, **kwargs: None)
-    monkeypatch.setattr(toolkit, "restore_domain", lambda *args, **kwargs: None)
-    monkeypatch.setattr(toolkit, "generate_viewer", lambda *args, **kwargs: None)
-    monkeypatch.setattr(toolkit, "verify_site", lambda *args, **kwargs: None)
-
-    args = ["archive_toolkit.py", "--data-root", str(root), command, "--site", "sample"]
-    if command in {"survey", "download", "verify"}:
-        args.extend(["--domains", "example.test"])
+    args = [
+        "archive_toolkit.py", "--data-root", str(root), command,
+        "--site", "sample", "--domains", "example.test", *archive_args,
+    ]
     monkeypatch.setattr(sys, "argv", args)
 
     toolkit.main()
 
-    assert received["root"] == root.resolve()
+    assert command_mock.call_args.kwargs["data_root"] == root.resolve()
+
+
+def test_download_root_forwarded(tmp_path, monkeypatch):
+    root = tmp_path / "external"
+    download_mock = Mock()
+    viewer_mock = Mock()
+    monkeypatch.setattr(toolkit, "restore_domain", download_mock)
+    monkeypatch.setattr(toolkit, "generate_viewer", viewer_mock)
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "archive_toolkit.py", "--data-root", str(root), "download",
+            "--site", "sample", "--domains", "example.test",
+        ],
+    )
+
+    toolkit.main()
+
+    site_root = root.resolve() / "sites" / "sample"
+    assert download_mock.call_args.args[1] == site_root / "files"
+    assert viewer_mock.call_args.args[0] == site_root / "files"
+    assert viewer_mock.call_args.kwargs["out_path"] == site_root / "viewer.html"
+
+
+def test_view_root_forwarded(tmp_path, monkeypatch):
+    root = tmp_path / "external"
+    viewer_mock = Mock()
+    monkeypatch.setattr(toolkit, "generate_viewer", viewer_mock)
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "archive_toolkit.py", "--data-root", str(root), "view",
+            "--site", "sample",
+        ],
+    )
+
+    toolkit.main()
+
+    site_root = root.resolve() / "sites" / "sample"
+    assert viewer_mock.call_args.args[0] == site_root / "files"
+    assert viewer_mock.call_args.kwargs["out_path"] == site_root / "viewer.html"
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        "https://example.test/../outside.txt",
+        "https://example.test/C:/outside.txt",
+        "https://example.test/%2e%2e/outside.txt",
+    ],
+)
+def test_wayback_path_rejected(original, tmp_path, monkeypatch):
+    record = {
+        "statuscode": "200",
+        "original": original,
+        "timestamp": "20200101000000",
+        "digest": digest(b"unsafe"),
+    }
+    refetch_mock = Mock()
+    monkeypatch.setattr(toolkit, "fetch_cdx_domain", lambda domain: ([record], True))
+    monkeypatch.setattr(toolkit, "refetch_verified", refetch_mock)
+
+    assert toolkit.restore_domain(["example.test"], tmp_path / "files", delay=0) == 0
+    refetch_mock.assert_not_called()
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_site_symlink_rejected(tmp_path):
+    root = tmp_path / "root"
+    external = tmp_path / "external"
+    base = root / "sites" / "sample"
+    base.mkdir(parents=True)
+    external.mkdir()
+    link = base / "files"
+    try:
+        link.symlink_to(external, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlink unavailable: {error}")
+
+    with pytest.raises(ValueError, match="링크|reparse"):
+        toolkit.site_paths("sample", data_root=root)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_site_junction_rejected(tmp_path):
+    root = tmp_path / "root"
+    external = tmp_path / "external"
+    base = root / "sites" / "sample"
+    base.mkdir(parents=True)
+    external.mkdir()
+    junction = base / "files"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        pytest.skip(f"junction unavailable: {result.stderr}")
+    try:
+        with pytest.raises(ValueError, match="링크|reparse"):
+            toolkit.site_paths("sample", data_root=root)
+    finally:
+        junction.rmdir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_destination_junction_rejected(tmp_path):
+    root = tmp_path / "files"
+    target = root / "target"
+    root.mkdir()
+    target.mkdir()
+    junction = root / "linked"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        pytest.skip(f"junction unavailable: {result.stderr}")
+    try:
+        with pytest.raises(ValueError, match="링크|reparse"):
+            toolkit.safe_destination(root, "linked/page.html")
+    finally:
+        junction.rmdir()
+
+
+def test_viewer_paths_escaped(tmp_path):
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "page#fragment&name.html").write_text("safe", encoding="utf-8")
+    (files / "flash&name.swf").write_bytes(b"safe")
+    viewer = tmp_path / "viewer.html"
+
+    toolkit.generate_viewer(files, viewer)
+
+    rendered = viewer.read_text(encoding="utf-8")
+    assert 'href="page%23fragment%26name.html"' in rendered
+    assert "page#fragment&amp;name.html" in rendered
+    assert "flash&amp;name.swf" in rendered
+    assert "flash&name.swf" not in rendered

@@ -7,7 +7,8 @@ Wayback Machine과 Common Crawl의 공개 색인을 조사하고, 보존된 원�
 - Python 3.10 이상
 - 테스트 실행 시 pytest
 
-런타임은 Python 표준 라이브러리만 사용합니다.
+기본 기능은 Python 표준 라이브러리만 사용합니다. `view --max-dim`으로 큰 이미지를
+뷰어 표시용으로 축소하려면 Pillow가 필요하며, 설치되어 있지 않으면 리사이즈 없이 원본을 포함합니다.
 
 ## 데이터 구조
 

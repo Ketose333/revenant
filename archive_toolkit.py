@@ -86,17 +86,38 @@ def resolve_data_root(cli_value=None):
     return Path(value or ROOT / "data").expanduser().resolve()
 
 
+def is_link_or_reparse(path):
+    """기존 심볼릭 링크와 Windows reparse point를 식별한다."""
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return path.is_symlink() or bool(
+        getattr(info, "st_file_attributes", 0) & 0x400
+    )
+
+
 def site_paths(site_id, data_root=None):
     if not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+){0,2}", site_id):
         raise ValueError(f"올바르지 않은 site id: {site_id}")
-    base = resolve_data_root(data_root) / "sites" / site_id
-    return {
+    root = resolve_data_root(data_root)
+    base = root / "sites" / site_id
+    paths = {
         "base": base,
         "files": base / "files",
         "captures": base / "captures",
         "inventory": base / "inventory.json",
         "viewer": base / "viewer.html",
     }
+    for path in paths.values():
+        if is_link_or_reparse(path):
+            raise ValueError(f"관리 경로의 링크 또는 reparse point는 허용하지 않는다: {path}")
+    try:
+        base.resolve().relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"사이트 경로가 data root 밖을 가리킨다: {base}") from error
+    return paths
 
 def fetch_cdx_domain(domain, headers=DEFAULT_HEADERS, tries=5):
     """도메인 하나를 matchType=domain으로 한 번에 훑는다.
@@ -314,8 +335,19 @@ def url_relative_path(original):
 
 def safe_destination(root, relative):
     """최종 저장 위치가 원본 루트 안인지 symlink까지 해석해 확인한다."""
-    root = Path(root).resolve()
-    target = (root / Path(relative)).resolve()
+    root_path = Path(root)
+    relative_path = Path(relative)
+    if relative_path.is_absolute():
+        raise ValueError(f"절대경로에는 저장하지 않는다: {relative_path}")
+    if is_link_or_reparse(root_path):
+        raise ValueError(f"저장 루트의 링크 또는 reparse point는 허용하지 않는다: {root_path}")
+    current = root_path
+    for part in relative_path.parts:
+        current /= part
+        if is_link_or_reparse(current):
+            raise ValueError(f"저장 경로의 링크 또는 reparse point는 허용하지 않는다: {current}")
+    root = root_path.resolve()
+    target = current.resolve()
     try:
         target.relative_to(root)
     except ValueError as e:
@@ -775,11 +807,11 @@ def restore_domain(domains, output_dir, max_workers=3, delay=0.15):
     for r in all_cdx:
         if r.get("statuscode", "") != "200":
             continue
-        parsed = urllib.parse.urlparse(clean_url(r.get("original", "")))
-        rel = decode_path_safe(parsed.path.lstrip("/"))
-        if not rel or rel.endswith("/"):
-            rel = rel + "index.html"
-        rel = rel.replace("\\", "/").strip("/")
+        try:
+            rel = url_relative_path(r.get("original", ""))
+        except ValueError as error:
+            print(f"  [건너뜀] {error}")
+            continue
         targets_map.setdefault(rel, []).append(r)
 
     for rel in targets_map:
@@ -790,7 +822,7 @@ def restore_domain(domains, output_dir, max_workers=3, delay=0.15):
     # 3. 다운로드 함수 — 지문이 기록과 맞을 때만 기록한다
     def download_file(item):
         rel, snaps = item
-        dest_file = out_path / Path(rel)
+        dest_file = safe_destination(out_path, rel)
         if dest_file.exists() and dest_file.stat().st_size > 0:
             return rel, True, "기존 파일 존재", dest_file.stat().st_size
 
@@ -907,17 +939,28 @@ def generate_viewer(target_dir, out_path, max_dim=None):
     </section>""")
     sections_html = "\n".join(sections)
 
-    pages_html = "\n".join(
-        f'      <a class="page-item" href="{p.relative_to(p_dir).as_posix()}" target="_blank">'
-        f'<span class="page-title">{html_mod.escape(p.name)}</span>'
-        f'<span class="page-path">{p.relative_to(p_dir).as_posix()} ({p.stat().st_size/1024:.1f} KB)</span></a>'
-        for p in pages
-    )
-    flash_html = "\n".join(
-        f'      <div class="page-item flash-item"><span class="page-title">{html_mod.escape(f.name)}</span>'
-        f'<span class="page-path">{f.relative_to(p_dir).as_posix()} · Flash(.swf), 브라우저 미리보기 불가</span></div>'
-        for f in flash
-    )
+    page_rows = []
+    for page in pages:
+        relative = page.relative_to(p_dir).as_posix()
+        href = urllib.parse.quote(relative, safe="/")
+        shown = html_mod.escape(relative)
+        page_rows.append(
+            f'      <a class="page-item" href="{href}" target="_blank" rel="noopener noreferrer">'
+            f'<span class="page-title">{html_mod.escape(page.name)}</span>'
+            f'<span class="page-path">{shown} ({page.stat().st_size/1024:.1f} KB)</span></a>'
+        )
+    pages_html = "\n".join(page_rows)
+
+    flash_rows = []
+    for item in flash:
+        relative = item.relative_to(p_dir).as_posix()
+        flash_rows.append(
+            f'      <div class="page-item flash-item">'
+            f'<span class="page-title">{html_mod.escape(item.name)}</span>'
+            f'<span class="page-path">{html_mod.escape(relative)} · '
+            f'Flash(.swf), 브라우저 미리보기 불가</span></div>'
+        )
+    flash_html = "\n".join(flash_rows)
 
     viewer_html = f"""<!DOCTYPE html>
 <html lang="ko">
