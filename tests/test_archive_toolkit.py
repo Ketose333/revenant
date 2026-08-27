@@ -79,6 +79,12 @@ def test_site_paths_scoped(tmp_path):
     assert paths["viewer"] == tmp_path.resolve() / "sites" / "sample" / "viewer.html"
 
 
+@pytest.mark.parametrize("site_id", ["../outside", "four_part_site_id", "UPPER"])
+def test_site_id_rejected(site_id, tmp_path):
+    with pytest.raises(ValueError, match="site id"):
+        toolkit.site_paths(site_id, data_root=tmp_path)
+
+
 @pytest.mark.parametrize("command", ["survey", "download", "view", "verify"])
 def test_cli_root_forwarded(command, tmp_path, monkeypatch):
     received = {}

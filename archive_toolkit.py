@@ -87,6 +87,8 @@ def resolve_data_root(cli_value=None):
 
 
 def site_paths(site_id, data_root=None):
+    if not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+){0,2}", site_id):
+        raise ValueError(f"올바르지 않은 site id: {site_id}")
     base = resolve_data_root(data_root) / "sites" / site_id
     return {
         "base": base,
